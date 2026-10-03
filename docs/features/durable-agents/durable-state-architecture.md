@@ -84,7 +84,7 @@ The operation begins by resolving the correlation before constructing or invokin
 
 After the outer agent response completes, `AgentEntity` re-evaluates history ownership because a model service can establish a conversation ID during the call. It then finalizes only the transcript owned by the entity, serializes the session without duplicating entity-owned in-memory history, seals the fixed binding, and calls `DurableAgentStateOutcomeResolver.AddSuccessfulResult`. The result and receipt are therefore part of the same working state as session continuation, binding, transcript, TTL, ingestion bookkeeping, and retention evidence.
 
-Setting `State` and scheduling entity self-signals use the Durable Entity operation/outbox commit. External model calls, tool calls, model-service conversations, and custom history-provider writes occur outside that transaction and require their own idempotency behavior.
+Setting `State` and scheduling entity self-signals use the Durable Entity operation/outbox commit. External model calls, tool calls, model-service conversations, and custom history-provider writes occur outside that transaction and require their own idempotency behavior. A provider or service adapter must treat a failed or missing acknowledgement as uncertain because the remote write may have completed even when the entity operation later fails.
 
 ## Duplicate and polling flow
 
@@ -117,23 +117,23 @@ History ownership controls where prior model context comes from; it does not con
 | `AgentSession` | Opaque restored session for a generic agent | Only the current request is passed |
 | `NoContextPipeline` | No discoverable Agent Framework context pipeline | `DurableAgentHistoryReplayMode` selects entity preload or current-request-only behavior |
 
-On each cold operation, `DurableAgentSessionState.RestoreAsync` reconstructs the session. `DurableAgentHistoryOwnershipResolver` inspects the public Agent Framework surface available from the agent and session, applies the configured replay policy, and produces the effective owner. `DurableAgentHistoryBinding` compares that owner with the persisted fixed binding and rejects a different owner or provider identity before model execution.
+When the internal schema 2 writer is active, each cold operation uses `DurableAgentSessionState.RestoreAsync` to reconstruct the session. `DurableAgentHistoryOwnershipResolver` inspects the public Agent Framework surface available from the agent and session, applies the configured replay policy, and produces the effective owner. `DurableAgentHistoryBinding` compares that owner with the persisted fixed binding and rejects a different owner or provider identity before model execution. Schema 1 remains the public default and preserves the pre-profile behavior without creating or enforcing a fixed binding.
+
+In schema 1, explicitly configured in-memory providers retain their declared session state, including reducer and filter output, across cold restarts. Their state is not a disposable copy of the entity transcript. The implicit default provider retains the legacy entity-replay behavior, while schema 2 uses the operation-scoped durable adapter for entity-owned history; superseded default-provider transcript state is excluded without removing unrelated session state.
+
+Recognized provisional bindings are also authoritative for provider identity: an explicitly configured provider key must match before the agent is constructed, while truly unrecognized profiles remain opaque and are never interpreted as C# provider identities. Prior continuity includes transcript entries, terminal results, completion receipts, recognized or opaque binding state, serialized sessions, ingestion positions, and truncation evidence, so transcript pruning cannot make an established session appear fresh.
 
 After execution, ownership is resolved again. A newly assigned real service conversation ID can transition a provisional first turn to service ownership. The final binding and serialized continuation are validated and committed together. Later workers must restore the same logical owner.
 
-The application or external provider remains responsible for availability, authorization, retention, deletion, residency, and consistency of history stored outside the entity. The durable extension is responsible for restoring the recorded continuation, selecting only one context source, and failing closed when it cannot prove a compatible owner.
+External providers must declare continuation `StateKeys`, and every declared key must contain usable non-empty JSON state before a bound invocation or final seal. Missing, null, blank-string, empty-container, and marker-only values do not prove that the same logical provider history can resume. A restored real service conversation and a custom history provider are conflicting authorities and are rejected before provider or model callbacks.
+
+The application or external provider remains responsible for availability, authorization, retention, deletion, residency, consistency, idempotency, and uncertain acknowledgement handling for history stored outside the entity. The durable extension is responsible for restoring the recorded continuation, selecting only one context source, and failing closed when it cannot prove a compatible owner.
 
 ## History configuration
 
 Closed choices are represented by enums: `DurableAgentHistoryReplayMode` has `PreloadEntityHistory` and `CurrentRequestOnly`; `DurableAgentHistoryRetentionMode` has `KeepAll` and `Auto`. History ownership is also a closed internal enum after resolution.
 
-Agent names and logical provider identities are open sets, so an enum is not appropriate for them. The current options address history policy by agent name and persist a logical provider key through:
-
-- `SetServiceManagedPerServiceCallHistory`
-- `SetHistoryReplayMode`
-- `SetHistoryProviderKey`
-
-History policy belongs to the agent registration; it should not require callers to repeat an agent name. A logical provider identity crosses the JSON wire as a string for interoperability, while public configuration can represent it with a validated value object or registration token. Applications should define any unavoidable identifier once as a constant or static typed value.
+Agent names and logical provider identities are open sets, so an enum is not appropriate for them. History policy is attached to `AddAIAgent` or `AddAIAgentFactory` through `DurableAgentHistoryOptions`; callers do not repeat the agent name. `DurableAgentHistoryProviderKey` validates the logical provider identity before registration. It crosses the JSON wire as a string for interoperability, but applications can define it once as a static typed value.
 
 The persisted `ownerKind` strings are not application configuration. `DurableAgentStateHistoryBinding` owns the constants and `DurableAgentHistoryBinding` converts the internal ownership enum to the wire profile. Callers should not construct `historyBinding` JSON or select an owner with a string.
 
@@ -149,7 +149,7 @@ These are independent mechanisms:
 
 `AgentEntity.ApplyRetentionAndCommit` performs due result expiry, writes the next generation-aware expiry schedule, invokes `DurableAgentStateRetention.Enforce`, validates serialization, schedules required self-signals, and finally replaces entity state. Automatic retention measures the complete serialized extension state, starts eviction at 85% of `MaxStateBytes`, and targets 70%. It fails the operation with `DurableAgentStateSizeLimitExceededException` when protected state cannot fit rather than deleting correctness-critical data.
 
-Model-context compaction is not pressure retention. Stateful compaction is rejected by the ownership layer because the current public Agent Framework contracts do not allow the durable runtime to prove safe replay and persistence behavior.
+Model-context compaction is not pressure retention. `CompactionProvider` may reduce only the messages sent to the model; its serialized session state counts toward the complete entity-state budget, and the durable transcript remains unchanged. Store-pruning behavior that follows compaction is deferred.
 
 ## Failure boundary
 

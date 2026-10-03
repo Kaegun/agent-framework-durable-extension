@@ -21,7 +21,15 @@ internal sealed class DurableAgentStateJsonConverter : JsonConverter<DurableAgen
             ref reader,
             DurableAgentStateJsonContext.Default.JsonElement);
 
-        return ReadElement(element, allowRevisedSchema: false);
+        DurableAgentState? state = ReadElement(element, allowRevisedSchema: true);
+        if (state?.SchemaVersion == DurableAgentState.RevisedSchemaVersion)
+        {
+            // This worker understands receipts. Preserve already revised state without a downgrade,
+            // including when a read-only duplicate operation republishes the hydrated state.
+            state.PersistentRequestOutcomesAuthorized = true;
+        }
+
+        return state;
     }
 
     internal static DurableAgentState DeserializeRevisedContract(string json)
@@ -141,7 +149,7 @@ internal sealed class DurableAgentStateJsonConverter : JsonConverter<DurableAgen
     /// <inheritdoc/>
     public override void Write(Utf8JsonWriter writer, DurableAgentState value, JsonSerializerOptions options)
     {
-        WriteValue(writer, value, allowRevisedSchema: false);
+        WriteValue(writer, value, allowRevisedSchema: value.PersistentRequestOutcomesAuthorized);
     }
 
     private static void WriteValue(
@@ -158,19 +166,21 @@ internal sealed class DurableAgentStateJsonConverter : JsonConverter<DurableAgen
         }
 
         value.Data.Validate(value.SchemaVersion);
-        JsonElement dataElement = JsonSerializer.SerializeToElement(
-            value.Data,
-            DurableAgentStateJsonContext.Default.DurableAgentStateData);
+        JsonElement data = JsonSerializer.SerializeToElement(
+            value.Data, DurableAgentStateJsonContext.Default.DurableAgentStateData);
         if (schemaVersion.Major < DurableAgentState.RevisedSchemaMajorVersion)
         {
-            ValidateLegacyTranscript(dataElement);
+            // Apply the historical reader's shape checks before publishing any legacy JSON.
+            // DTOs and extension properties must not bypass the legacy message adapters.
+            RejectLegacyRevisedFields(data);
+            ValidateLegacyTranscript(data);
         }
 
         writer.WriteStartObject();
         writer.WritePropertyName(SchemaVersionPropertyName);
         writer.WriteStringValue(value.SchemaVersion);
         writer.WritePropertyName(DataPropertyName);
-        dataElement.WriteTo(writer);
+        data.WriteTo(writer);
         if (value.ExtensionData is not null)
         {
             writer.WritePropertyName(ExtensionDataPropertyName);
@@ -870,8 +880,9 @@ internal sealed class DurableAgentStateJsonConverter : JsonConverter<DurableAgen
                 }
 
                 DurableAgentStateContract.ValidateIdentifier(
-                    correlation.GetString(),
-                    "conversationHistory.correlationId");
+                    value: correlation.GetString(),
+                    diagnosticPath:
+                        $"{nameof(DurableAgentStateData.ConversationHistory)}.{nameof(DurableAgentStateEntry.CorrelationId)}");
             }
 
             if (entry.TryGetProperty("messages", out JsonElement messages))
@@ -1064,14 +1075,21 @@ internal sealed class DurableAgentStateJsonConverter : JsonConverter<DurableAgen
         JsonElement element,
         string path,
         params string[] recognizedProperties)
+        => ValidateNoDuplicateRecognizedProperties(element, path, StringComparer.Ordinal, recognizedProperties);
+
+    internal static void ValidateNoDuplicateRecognizedProperties(
+        JsonElement element,
+        string path,
+        StringComparer comparer,
+        params string[] recognizedProperties)
     {
         if (element.ValueKind != JsonValueKind.Object)
         {
             return;
         }
 
-        HashSet<string> recognized = new(recognizedProperties, StringComparer.Ordinal);
-        HashSet<string> encountered = new(StringComparer.Ordinal);
+        HashSet<string> recognized = new(recognizedProperties, comparer);
+        HashSet<string> encountered = new(comparer);
         foreach (JsonProperty property in element.EnumerateObject())
         {
             if (recognized.Contains(property.Name) && !encountered.Add(property.Name))

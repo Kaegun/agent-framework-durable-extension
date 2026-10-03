@@ -1,5 +1,7 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
+using Microsoft.Agents.AI.DurableTask.State;
+
 namespace Microsoft.Agents.AI.DurableTask;
 
 /// <summary>
@@ -10,6 +12,7 @@ public sealed class DurableAgentsOptions
     // Agent names are case-insensitive
     private readonly Dictionary<string, Func<IServiceProvider, AIAgent>> _agentFactories = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TimeSpan?> _agentTimeToLive = new(StringComparer.OrdinalIgnoreCase);
+    private bool _defaultTimeToLiveConfigured;
 
     // Agents that were discovered on a workflow rather than registered explicitly by the caller. Hosts use
     // this to decide whether an agent should get its own entry points: an agent that only exists because a
@@ -27,7 +30,76 @@ public sealed class DurableAgentsOptions
     /// If an agent entity is idle for this duration, it will be automatically deleted.
     /// Defaults to 14 days. Set to <see langword="null"/> to disable TTL for agents without explicit TTL configuration.
     /// </remarks>
-    public TimeSpan? DefaultTimeToLive { get; set; } = TimeSpan.FromDays(14);
+    public TimeSpan? DefaultTimeToLive
+    {
+        get;
+        set
+        {
+            this._defaultTimeToLiveConfigured = true;
+            field = value;
+        }
+    } = TimeSpan.FromDays(14);
+
+    /// <summary>
+    /// Gets or sets whether successful entity operations may persist schema 2.0 request outcomes.
+    /// Defaults to <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// This internal switch supports execution tests only; it is not a production rollout API.
+    /// Public activation awaits shared contract, consumer/rollback, and late-duplicate policy agreement.
+    /// Readers support both layouts regardless of this setting.
+    /// </remarks>
+    internal bool EnablePersistentRequestOutcomes { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether a certified provider adapter may commit explicitly attested terminal failures.
+    /// </summary>
+    /// <remarks>
+    /// This internal capability is disabled by default. It is not enabled merely by mailbox activation.
+    /// </remarks>
+    internal bool EnableProviderFailureFinalization { get; set; }
+
+    /// <summary>
+    /// Gets or sets the test-only agreement to delete receipt-bearing entities after an explicit TTL.
+    /// Production deletion remains disabled until a late-duplicate policy is agreed.
+    /// </summary>
+    internal bool EnableMailboxEntityDeletion { get; set; }
+
+    /// <summary>
+    /// Gets or sets a trusted, per-state authorization for complete synthetic legacy migration fixtures.
+    /// </summary>
+    /// <remarks>
+    /// No production authorization is installed. Retained transcript entries, an empty transcript,
+    /// or an absence of truncation metadata cannot prove that earlier completions were not evicted.
+    /// Known truncation/compaction prevents migration even when this callback authorizes the fixture.
+    /// </remarks>
+    internal Func<DurableAgentState, bool>? AuthorizeLegacyMigration { get; set; }
+
+    /// <summary>
+    /// Gets or sets optional retention for persisted request outcome payloads. Defaults to 60 seconds.
+    /// Completion receipts remain until the whole entity is deleted.
+    /// </summary>
+    /// <remarks>
+    /// When persistent request outcomes are enabled, committed runs schedule entity-local payload cleanup.
+    /// Physical removal may lag expiry; polling reports unavailable without modifying state.
+    /// Imported states without a scheduled check need an explicit cleanup operation or a successful new run.
+    /// The schema-2 mailbox writer remains an internal, default-off rollout capability in this release, so this
+    /// public setting does not activate mailbox persistence by itself.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The retention period is not positive.</exception>
+    public TimeSpan? ResultRetentionPeriod
+    {
+        get;
+        set
+        {
+            if (value <= TimeSpan.Zero)
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Result retention must be positive.");
+            }
+
+            field = value;
+        }
+    } = TimeSpan.FromSeconds(60);
 
     /// <summary>
     /// Gets or sets the minimum delay for scheduling TTL deletion signals. Defaults to 5 minutes.
@@ -168,10 +240,22 @@ public sealed class DurableAgentsOptions
     /// Gets the time-to-live for a specific agent, or the default TTL if not specified.
     /// </summary>
     /// <param name="agentName">The name of the agent.</param>
+    /// <param name="revisedState">Whether receipt-aware state requires an explicit deletion policy and TTL.</param>
     /// <returns>The time-to-live for the agent, or the default TTL if not specified.</returns>
-    internal TimeSpan? GetTimeToLive(string agentName)
+    internal TimeSpan? GetTimeToLive(string agentName, bool revisedState = false)
     {
-        return this._agentTimeToLive.TryGetValue(agentName, out TimeSpan? ttl) ? ttl : this.DefaultTimeToLive;
+        if (revisedState && !this.EnableMailboxEntityDeletion)
+        {
+            return null;
+        }
+
+        if (this._agentTimeToLive.TryGetValue(agentName, out TimeSpan? ttl))
+        {
+            return ttl;
+        }
+
+        // The legacy idle default must not silently delete completion evidence in revised state.
+        return revisedState && !this._defaultTimeToLiveConfigured ? null : this.DefaultTimeToLive;
     }
 
     /// <summary>

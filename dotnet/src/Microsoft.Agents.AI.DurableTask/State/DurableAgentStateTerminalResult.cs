@@ -99,7 +99,9 @@ internal sealed class DurableAgentStateTerminalResult
         JsonElement structuredValue = default,
         ILogger? logger = null)
     {
-        DurableAgentStateContract.ValidateIdentifier(correlationId, "terminalResults.correlationId");
+        DurableAgentStateContract.ValidateIdentifier(
+            value: correlationId,
+            diagnosticPath: $"{nameof(DurableAgentStateData.TerminalResults)}.{nameof(CorrelationId)}");
         return new()
         {
             CorrelationId = correlationId,
@@ -117,8 +119,12 @@ internal sealed class DurableAgentStateTerminalResult
 
     public void Validate(string dictionaryKey)
     {
-        DurableAgentStateContract.ValidateIdentifier(dictionaryKey, "terminalResults key");
-        DurableAgentStateContract.ValidateIdentifier(this.CorrelationId, "terminalResults.correlationId");
+        DurableAgentStateContract.ValidateIdentifier(
+            value: dictionaryKey,
+            diagnosticPath: $"{nameof(DurableAgentStateData.TerminalResults)}.{nameof(dictionaryKey)}");
+        DurableAgentStateContract.ValidateIdentifier(
+            value: this.CorrelationId,
+            diagnosticPath: $"{nameof(DurableAgentStateData.TerminalResults)}.{nameof(this.CorrelationId)}");
         if (!string.Equals(dictionaryKey, this.CorrelationId, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(

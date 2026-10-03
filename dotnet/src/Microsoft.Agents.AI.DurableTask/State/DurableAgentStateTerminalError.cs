@@ -29,7 +29,10 @@ internal sealed class DurableAgentStateTerminalError
 
     public void Validate()
     {
-        DurableAgentStateContract.ValidateIdentifier(this.Code, "terminalResults.error.code");
+        DurableAgentStateContract.ValidateIdentifier(
+            value: this.Code,
+            diagnosticPath:
+                $"{nameof(DurableAgentStateData.TerminalResults)}.{nameof(DurableAgentStateTerminalResult.Error)}.{nameof(this.Code)}");
         if (string.IsNullOrWhiteSpace(this.Message) ||
             this.Message.EnumerateRunes()
                 .Take(DurableAgentStateContract.MaxMetadataStringLength + 1)

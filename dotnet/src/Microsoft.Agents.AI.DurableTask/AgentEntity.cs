@@ -121,6 +121,8 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         AgentSessionId sessionId = this.Context.Id;
         // Logger category is Microsoft.DurableTask.Agents.{registeredAgentName}.{sessionId}
         ILogger logger = this.GetLogger(sessionId.Name, sessionId.Key);
+        DurableAgentRetentionSettings retentionSettings =
+            this._options.GetRetentionSettings();
 
         string correlationId = request.CorrelationId;
         if (string.IsNullOrWhiteSpace(correlationId))
@@ -157,16 +159,32 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             // without comparing request content, so callers must not reuse it for another request.
             // Surface failures before optional migration so failed delivery never writes state.
             AgentResponse committedResponse = resolvedOutcome.GetResponse(correlationId);
-            if (this._options.EnablePersistentRequestOutcomes &&
+            bool legacyMailboxMigrationRequested =
+                this._options.EnablePersistentRequestOutcomes &&
+                this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion;
+            bool migrationAuthorized =
+                legacyMailboxMigrationRequested &&
+                this._options.AuthorizeLegacyMigration?.Invoke(this.State) == true;
+            if (this._options.HistoryRetentionMode == DurableAgentHistoryRetentionMode.Auto &&
                 this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
-                this._options.AuthorizeLegacyMigration?.Invoke(this.State) == true &&
+                !migrationAuthorized)
+            {
+                throw new DurableAgentStateCorruptionException(
+                    "Automatic history retention requires schema 2 mailbox state. Legacy terminal transcript " +
+                    "entries must be converted from independently authoritative complete history before delivery.");
+            }
+            if (legacyMailboxMigrationRequested &&
+                migrationAuthorized &&
                 resolvedOutcome.Kind != DurableAgentRunOutcomeKind.CompletedResultUnavailable)
             {
                 // Legacy evidence is converted without constructing or invoking the agent.
                 DurableAgentState migrated = DurableAgentStateOutcomeResolver.PrepareRevisedWorkingState(
                     this.State, hasAuthoritativeLegacyHistory: true);
-                ValidateForCommit(migrated);
-                this.State = migrated;
+                this.ApplyRetentionAndCommit(
+                    migrated,
+                    sessionId,
+                    logger,
+                    entityDeletionCheckExpiration: null);
             }
 
             return committedResponse;
@@ -199,6 +217,15 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         bool migrateLegacy = this._options.EnablePersistentRequestOutcomes &&
             this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
             this._options.AuthorizeLegacyMigration?.Invoke(this.State) == true;
+        if (this._options.HistoryRetentionMode == DurableAgentHistoryRetentionMode.Auto &&
+            this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
+            !migrateLegacy)
+        {
+            throw new DurableAgentStateCorruptionException(
+                "Automatic history retention requires schema 2 mailbox state. Legacy terminal transcript " +
+                "entries must be converted from independently authoritative complete history before execution.");
+        }
+
         DurableAgentState workingState = migrateLegacy
             ? DurableAgentStateOutcomeResolver.PrepareRevisedWorkingState(this.State, hasAuthoritativeLegacyHistory: true)
             : this.State.Clone();
@@ -344,6 +371,14 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
                     workingState.SchemaVersion == DurableAgentState.RevisedSchemaVersion,
                     logger)
                 : null;
+            DurableAgentStateRetention.ValidateProtectedFloor(
+                workingState,
+                retentionSettings,
+                currentTime,
+                entityOwnedHistory &&
+                    workingState.SchemaVersion == DurableAgentState.RevisedSchemaVersion
+                    ? DurableAgentStateRequest.FromRunRequestV2(request, logger)
+                    : null);
             agentWrapper = new(
                 agent,
                 this.Context,
@@ -494,9 +529,11 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
 
             DateTime? entityDeletionCheckExpiration =
                 this.UpdateEntityExpiration(workingState, sessionId, logger);
-            this._cancellationToken.ThrowIfCancellationRequested();
-            this.CommitWorkingState(workingState, sessionId, logger, entityDeletionCheckExpiration);
-
+            this.ApplyRetentionAndCommit(
+                workingState,
+                sessionId,
+                logger,
+                entityDeletionCheckExpiration);
             return response;
         }
         catch (InvalidOperationException exception) when (
@@ -768,7 +805,11 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         DateTime? entityDeletionCheckExpiration =
             this.UpdateEntityExpiration(workingState, sessionId, logger);
         this._cancellationToken.ThrowIfCancellationRequested();
-        this.CommitWorkingState(workingState, sessionId, logger, entityDeletionCheckExpiration);
+        this.ApplyRetentionAndCommit(
+            workingState,
+            sessionId,
+            logger,
+            entityDeletionCheckExpiration);
         return response;
     }
 
@@ -913,41 +954,126 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             cancellationToken);
     }
 
-    private void CommitWorkingState(
+    private void ApplyRetentionAndCommit(
         DurableAgentState workingState,
         AgentSessionId sessionId,
         ILogger logger,
         DateTime? entityDeletionCheckExpiration,
         DateTimeOffset? previousResultCheckTime = null)
     {
-        DateTimeOffset currentTime = this._timeProvider.GetUtcNow();
-        workingState = this.UpdateResultExpirationSchedule(
-            workingState,
-            currentTime,
-            previousResultCheckTime,
-            out AgentEntityResultExpirationCheck? nextResultExpirationSignal);
-
-        this._cancellationToken.ThrowIfCancellationRequested();
-        ValidateForCommit(workingState);
-        if (entityDeletionCheckExpiration.HasValue)
+        RetentionResult? retention = null;
+        bool operationRecorded = false;
+        string commitStatus = DurableAgentTelemetry.NotAttemptedCommitStatus;
+        try
         {
-            // this.State still points at the hydrated state until the final assignment.
-            this.ScheduleEntityDeletionCheck(sessionId, logger, entityDeletionCheckExpiration.Value);
-        }
+            DateTimeOffset currentTime = this._timeProvider.GetUtcNow();
+            workingState = this.UpdateResultExpirationSchedule(
+                workingState,
+                currentTime,
+                previousResultCheckTime,
+                out AgentEntityResultExpirationCheck? nextResultExpirationSignal);
 
-        if (nextResultExpirationSignal is not null)
+            retention = DurableAgentStateRetention.EnforceForCommit(
+                workingState,
+                this._options.GetRetentionSettings(),
+                currentTime,
+                logger,
+                sessionId);
+            bool deletionStaged = retention?.RemovedEntryCount > 0;
+
+            this._cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                ValidateForCommit(workingState);
+                if (retention is not null)
+                {
+                    DurableAgentTelemetry.RecordWrite(
+                        DurableAgentTelemetry.SerializationStage,
+                        DurableAgentTelemetry.ReturnedOutcome,
+                        DurableAgentTelemetry.NotAttemptedCommitStatus,
+                        deletionStaged);
+                }
+            }
+            catch (Exception)
+            {
+                if (retention is not null)
+                {
+                    DurableAgentTelemetry.RecordWrite(
+                        DurableAgentTelemetry.SerializationStage,
+                        DurableAgentTelemetry.FailedOutcome,
+                        DurableAgentTelemetry.NotAttemptedCommitStatus,
+                        deletionStaged);
+                }
+
+                throw;
+            }
+
+            if (entityDeletionCheckExpiration.HasValue)
+            {
+                // this.State still points at the hydrated state until the final assignment.
+                this.ScheduleEntityDeletionCheck(sessionId, logger, entityDeletionCheckExpiration.Value);
+            }
+
+            if (nextResultExpirationSignal is not null)
+            {
+                this.Context.SignalEntity(
+                    this.Context.Id,
+                    nameof(CheckAndExpireResults),
+                    nextResultExpirationSignal,
+                    options: new SignalEntityOptions { SignalTime = nextResultExpirationSignal.ScheduledTime });
+            }
+
+            this._cancellationToken.ThrowIfCancellationRequested();
+            // This setter performs no synchronous backend I/O. TaskEntity persists the replacement
+            // and the self-signal outbox only after the operation completes successfully.
+            commitStatus = DurableAgentTelemetry.UnknownCommitStatus;
+            try
+            {
+                this.State = workingState;
+                if (retention is not null)
+                {
+                    DurableAgentTelemetry.RecordWrite(
+                        DurableAgentTelemetry.SetStateStage,
+                        DurableAgentTelemetry.ReturnedOutcome,
+                        commitStatus,
+                        deletionStaged);
+                }
+            }
+            catch (Exception)
+            {
+                if (retention is not null)
+                {
+                    DurableAgentTelemetry.RecordWrite(
+                        DurableAgentTelemetry.SetStateStage,
+                        DurableAgentTelemetry.FailedOutcome,
+                        commitStatus,
+                        deletionStaged);
+                }
+
+                throw;
+            }
+
+            if (retention is not null)
+            {
+                DurableAgentTelemetry.RecordOperation(
+                    DurableAgentTelemetry.ReturnedOutcome,
+                    commitStatus,
+                    deletionStaged);
+                operationRecorded = true;
+            }
+        }
+        catch (Exception)
         {
-            this.Context.SignalEntity(
-                this.Context.Id,
-                nameof(CheckAndExpireResults),
-                nextResultExpirationSignal,
-                options: new SignalEntityOptions { SignalTime = nextResultExpirationSignal.ScheduledTime });
-        }
+            if (retention is not null && !operationRecorded)
+            {
+                DurableAgentTelemetry.RecordOperation(
+                    DurableAgentTelemetry.FailedOutcome,
+                    commitStatus,
+                    retention.RemovedEntryCount > 0);
+            }
 
-        this._cancellationToken.ThrowIfCancellationRequested();
-        // This setter performs no synchronous backend I/O. TaskEntity persists the replacement
-        // and the self-signal outbox only after the operation completes successfully.
-        this.State = workingState;
+            throw;
+        }
     }
 
     private static void ValidateForCommit(DurableAgentState state)

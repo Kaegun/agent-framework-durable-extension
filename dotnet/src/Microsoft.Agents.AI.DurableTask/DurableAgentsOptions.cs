@@ -131,6 +131,118 @@ public sealed class DurableAgentsOptions
     } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Gets or sets the internal pressure-retention mode.
+    /// </summary>
+    /// <remarks>
+    /// Pressure retention remains behind the same internal rollout gate as schema 2 mailbox writes.
+    /// It is not a public activation surface until every participating reader and rollback target is compatible.
+    /// </remarks>
+    internal DurableAgentHistoryRetentionMode HistoryRetentionMode
+    {
+        get;
+        set => field = Enum.IsDefined(value)
+            ? value
+            : throw new ArgumentOutOfRangeException(
+                nameof(value),
+                value,
+                "The durable agent history retention mode is not supported.");
+    } = DurableAgentHistoryRetentionMode.KeepAll;
+
+    /// <summary>
+    /// Gets or sets the explicit storage-envelope byte budget for internal automatic retention.
+    /// </summary>
+    internal int? MaxStateBytes
+    {
+        get;
+        set => field = value is null or > 0
+            ? value
+            : throw new ArgumentOutOfRangeException(
+                nameof(value),
+                value,
+                "The durable agent state budget must be null or a positive byte count.");
+    }
+
+    /// <summary>
+    /// Gets or sets an internal override for the fraction at which pressure retention starts.
+    /// </summary>
+    internal double? HistoryRetentionHighWatermark
+    {
+        get;
+        set
+        {
+            ValidateWatermark(value, nameof(value));
+            field = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets an internal override for the fraction pressure retention targets.
+    /// </summary>
+    internal double? HistoryRetentionLowWatermark
+    {
+        get;
+        set
+        {
+            ValidateWatermark(value, nameof(value));
+            field = value;
+        }
+    }
+
+    internal DurableAgentRetentionSettings GetRetentionSettings()
+    {
+        if (this.HistoryRetentionMode == DurableAgentHistoryRetentionMode.KeepAll)
+        {
+            if (this.MaxStateBytes.HasValue ||
+                this.HistoryRetentionHighWatermark.HasValue ||
+                this.HistoryRetentionLowWatermark.HasValue)
+            {
+                throw new InvalidOperationException(
+                    "A durable state budget and retention watermarks are only valid when automatic history retention is enabled.");
+            }
+
+            return new(
+                DurableAgentHistoryRetentionMode.KeepAll,
+                MaxStateBytes: null,
+                DurableAgentStateRetention.DefaultHighWatermark,
+                DurableAgentStateRetention.DefaultLowWatermark);
+        }
+
+        if (this.MaxStateBytes is not int maxStateBytes)
+        {
+            throw new InvalidOperationException(
+                "Automatic durable history retention requires an explicit positive state byte budget.");
+        }
+
+        double highWatermark =
+            this.HistoryRetentionHighWatermark ?? DurableAgentStateRetention.DefaultHighWatermark;
+        double lowWatermark =
+            this.HistoryRetentionLowWatermark ?? DurableAgentStateRetention.DefaultLowWatermark;
+        if (lowWatermark >= highWatermark)
+        {
+            throw new InvalidOperationException(
+                "Durable history retention watermarks must satisfy 0 < low < high <= 1.");
+        }
+
+        return new(
+            DurableAgentHistoryRetentionMode.Auto,
+            maxStateBytes,
+            highWatermark,
+            lowWatermark);
+    }
+
+    private static void ValidateWatermark(double? value, string parameterName)
+    {
+        if (value.HasValue &&
+            (!double.IsFinite(value.Value) || value.Value <= 0 || value.Value > 1))
+        {
+            throw new ArgumentOutOfRangeException(
+                parameterName,
+                value,
+                "A durable history retention watermark must be a finite number in (0, 1].");
+        }
+    }
+
+    /// <summary>
     /// Adds an AI agent factory to the options.
     /// </summary>
     /// <param name="name">The name of the agent.</param>
@@ -335,6 +447,12 @@ public sealed class DurableAgentsOptions
         return this._agentFactories.ContainsKey(agentName);
     }
 }
+
+internal readonly record struct DurableAgentRetentionSettings(
+    DurableAgentHistoryRetentionMode Mode,
+    int? MaxStateBytes,
+    double HighWatermark,
+    double LowWatermark);
 
 internal readonly record struct DurableAgentHistoryConfiguration(
     bool ServiceManagedPerServiceCallHistory,

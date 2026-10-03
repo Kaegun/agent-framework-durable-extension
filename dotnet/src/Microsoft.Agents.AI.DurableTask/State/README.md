@@ -59,7 +59,10 @@ Usage counts and `extensionData` are preserved as arbitrary JSON integers and JS
 compatibility. When a durable response is projected to `UsageDetails`, only exact integral values representable
 as `Int64` become runtime counts; strings, objects, arrays, fractional numbers, and out-of-range numbers remain
 in durable state but are ignored by the runtime projection. Malformed known count fields fail deserialization
-rather than being silently reinterpreted.
+rather than being silently reinterpreted. Automatic retention uses the same exact projection for recognized
+`evictedMessageCount` integer spellings. The projected value must be a nonnegative signed `Int64`; retention
+checks the cumulative increment and rejects overflow before committing any staged deletion or other working-state
+change. Opaque JSON and unknown metadata retain their existing exact preservation behavior.
 
 Mailbox lookup, delivery, and guarded entity-local commit behavior are implemented. Session ownership,
 replay filtering, transcript compaction, and provider behavior remain deferred to later stack layers.
